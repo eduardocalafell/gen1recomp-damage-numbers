@@ -1,26 +1,28 @@
 -- Damage Numbers
 -- ---------------------------------------------------------------------------
--- Shows RPG-style floating damage numbers above the Pokemon that just got hit.
+-- RPG-style floating damage numbers over the Pokemon that just got hit.
 --
--- How it works (see the gen1recomp engine source):
---   * The engine fires  battle.damage_dealt  right after a move connects, with
---     the *actual* HP removed (already capped at the target's remaining HP).
---     We just listen for it -- no need to diff HP frame by frame.
---   * We draw through the official  battle.overlay  hook, which runs at the end
---     of the battle draw in native Game Boy pixels (160x144). markTrueColor
---     keeps our colors from being re-quantized by the palette pass.
---
--- Everything you'd normally want to tweak is a named constant below.
+-- v0.2.0 design (see the gen1recomp engine source):
+--   * VALUE comes from the battle.damage_dealt event (the real HP removed).
+--   * TIMING is driven by battler.shownHP -- the HP the bar actually displays
+--     as it drains (BattleState makeBattler: "shownHP = the HP the bar
+--     displays"). We only pop the number when that bar STARTS draining, which
+--     is after the attack animation, not during turn resolution.
+--   * The number is drawn in the engine's own Game Boy font (src.render.Font),
+--     inside a small white box like the game's UI, and it fades on REAL TIME
+--     (love.timer.getTime) so fast-forward (--speed / x4) doesn't blink it away.
 -- ---------------------------------------------------------------------------
 
 return function(mod)
-  -- PaletteFX lets colored pixels survive the palette post-process. Optional:
-  -- if it's unavailable the numbers still draw, just palette-mapped.
+  local ok_font, Font = pcall(require, "src.render.Font")
+  if not ok_font then Font = nil end
   local ok_pfx, PaletteFX = pcall(require, "src.render.PaletteFX")
   if not ok_pfx then PaletteFX = nil end
+  local getTime = (love.timer and love.timer.getTime) or nil
+  local function now() return getTime and getTime() or 0 end
 
   ----------------------------------------------------------------------------
-  -- Options (appear under this mod's OPTIONS in the mod manager)
+  -- Options
   ----------------------------------------------------------------------------
   mod.options:define({
     {
@@ -31,11 +33,11 @@ return function(mod)
       choices = { { "ON", "on" }, { "OFF", "off" } },
     },
     {
-      key = "crit_color",
-      label = "CRIT COLOR",
+      key = "size",
+      label = "NUMBER SIZE",
       type = "choice",
-      default = "gold",
-      choices = { { "GOLD", "gold" }, { "WHITE", "white" } },
+      default = "2x",
+      choices = { { "1X", "1x" }, { "2X", "2x" } },
     },
   })
 
@@ -48,151 +50,161 @@ return function(mod)
   end
 
   ----------------------------------------------------------------------------
-  -- 3x5 pixel digit font
+  -- Tunables (real seconds for time, native GB pixels for layout)
   ----------------------------------------------------------------------------
-  local GLYPHS = {
-    ["0"] = { "111", "101", "101", "101", "111" },
-    ["1"] = { "010", "110", "010", "010", "111" },
-    ["2"] = { "111", "001", "111", "100", "111" },
-    ["3"] = { "111", "001", "111", "001", "111" },
-    ["4"] = { "101", "101", "111", "001", "001" },
-    ["5"] = { "111", "100", "111", "001", "111" },
-    ["6"] = { "111", "100", "111", "101", "111" },
-    ["7"] = { "111", "001", "010", "010", "010" },
-    ["8"] = { "111", "101", "111", "101", "111" },
-    ["9"] = { "111", "101", "111", "001", "111" },
-  }
-  local GLYPH_W, GLYPH_H, ADVANCE = 3, 5, 4 -- 3px wide + 1px gap = 4px per digit
-
-  ----------------------------------------------------------------------------
-  -- Animation / layout knobs -- tweak these freely
-  ----------------------------------------------------------------------------
-  local LIFE = 50 -- frames a number stays on screen
-  local FADE = 16 -- frames of fade-out at the end
-  local RISE = 14 -- pixels it floats upward over its life
+  local LIFE = 0.95 -- seconds a number stays on screen
+  local FADE = 0.30 -- seconds of fade-out at the end
+  local RISE = 16 -- native px it floats upward over its life
+  local STALE = 2.5 -- drop a pending hit if the bar never drains within this
+  local PADX = 3 -- box horizontal padding (unscaled px)
+  local BOXH = 9 -- box height (8px font + 1)
+  local CRIT = { 1.00, 0.82, 0.20 } -- gold accent for crits
   local ANCHOR = {
-    -- Enemy front sprite sits in the 7x7 slot at hlcoord 12,0 (x=96..152).
-    foe = { x = 120, y = 34 },
-    -- Player back sprite: x=8, feet at y=96, drawn 2x.
-    player = { x = 44, y = 66 },
+    foe = { x = 120, y = 34 }, -- enemy front sprite (7x7 slot, hlcoord 12,0)
+    player = { x = 44, y = 66 }, -- player back sprite (x=8, feet y=96, 2x)
   }
-  local CRIT_COLOR = { 1.00, 0.82, 0.20 } -- gold
 
   ----------------------------------------------------------------------------
-  -- Active numbers + a little spread so multi-hit moves don't stack exactly
+  -- State
   ----------------------------------------------------------------------------
-  local active = {} -- { amount, isPlayer, crit, born, battle, dx }
-  local spread = { foe = 0, player = 0 }
-  local lastSpreadFrame = { foe = -999, player = -999 }
+  -- pending damage waiting for its bar to start draining
+  local pending = {
+    foe = { total = 0, crit = false, at = 0 },
+    player = { total = 0, crit = false, at = 0 },
+  }
+  local prevShown = { foe = nil, player = nil }
+  local draining = { foe = false, player = false }
+  local floats = {} -- { amount, side, crit, born }
+  local curBattle = nil
 
+  -- accurate value + crit flag, straight from the engine
   mod.events:on("battle.damage_dealt", function(e)
-    if not e or not e.target or type(e.damage) ~= "number" then return end
-    if e.damage <= 0 then return end
+    if not e or not e.target or type(e.damage) ~= "number" or e.damage <= 0 then
+      return
+    end
     local side = e.target.isPlayer and "player" or "foe"
-    local frame = (e.battle and e.battle.frame) or 0
-    -- reset the spread counter once a burst of same-side hits is over
-    if frame - lastSpreadFrame[side] > 8 then spread[side] = 0 end
-    lastSpreadFrame[side] = frame
-    local dx = (spread[side] % 3 - 1) * 9 -- -9, 0, +9, repeating
-    spread[side] = spread[side] + 1
-    active[#active + 1] = {
-      amount = math.floor(e.damage + 0.5),
-      isPlayer = e.target.isPlayer and true or false,
-      crit = e.crit and true or false,
-      born = frame,
-      battle = e.battle,
-      dx = dx,
-    }
-    if #active > 24 then table.remove(active, 1) end
+    local p = pending[side]
+    p.total = p.total + math.floor(e.damage + 0.5)
+    p.crit = p.crit or (e.crit and true or false)
+    p.at = now()
   end)
 
+  local function resetFor(battle)
+    curBattle = battle
+    prevShown.foe, prevShown.player = nil, nil
+    draining.foe, draining.player = false, false
+    pending.foe.total, pending.foe.crit = 0, false
+    pending.player.total, pending.player.crit = 0, false
+    floats = {}
+  end
+
   ----------------------------------------------------------------------------
-  -- Draw one number: black outline pass, then colored fill pass
+  -- Draw one number: white box + black GB-font digits, gold frame on crits
   ----------------------------------------------------------------------------
-  local function drawNumber(text, cx, cy, r, g, b, a)
+  local function drawFloat(f, scale, t0)
+    if not Font then return end
+    local text = tostring(f.amount)
+    local tw = Font.width(text)
+    local boxW = tw + PADX * 2
+    local boxH = BOXH
+
+    local age = t0 - f.born
+    local t = age / LIFE
+    local anchor = f.side == "player" and ANCHOR.player or ANCHOR.foe
+    local cx = anchor.x
+    local cy = anchor.y - RISE * (1 - (1 - t) * (1 - t)) -- ease-out rise
+    local a = 1
+    if age > LIFE - FADE then a = math.max(0, (LIFE - age) / FADE) end
+
     local gfx = love.graphics
-    local totalW = #text * ADVANCE - 1
-    local ox = math.floor(cx - totalW / 2 + 0.5)
-    local oy = math.floor(cy - GLYPH_H / 2 + 0.5)
+    gfx.push("all")
+    gfx.setShader()
+    gfx.translate(cx, cy)
+    gfx.scale(scale, scale)
 
-    -- pass 1: 3x3 black block behind every lit pixel -> clean 1px outline
+    local x0 = math.floor(-boxW / 2)
+    local y0 = math.floor(-boxH / 2)
+    -- white box like the game's text UI
+    gfx.setColor(1, 1, 1, a)
+    gfx.rectangle("fill", x0, y0, boxW, boxH)
+    -- black 1px frame
     gfx.setColor(0, 0, 0, a)
-    for i = 1, #text do
-      local rows = GLYPHS[text:sub(i, i)]
-      if rows then
-        local gx = ox + (i - 1) * ADVANCE
-        for py = 1, GLYPH_H do
-          local row = rows[py]
-          for px = 1, GLYPH_W do
-            if row:sub(px, px) == "1" then
-              gfx.rectangle("fill", gx + px - 2, oy + py - 2, 3, 3)
-            end
-          end
-        end
-      end
+    gfx.rectangle("line", x0 + 0.5, y0 + 0.5, boxW - 1, boxH - 1)
+    -- crit: gold inner frame
+    if f.crit then
+      gfx.setColor(CRIT[1], CRIT[2], CRIT[3], a)
+      gfx.rectangle("line", x0 + 1.5, y0 + 1.5, boxW - 3, boxH - 3)
     end
+    -- digits: engine GB font renders black; alpha still fades it
+    gfx.setColor(1, 1, 1, a)
+    Font.draw(text, x0 + PADX, y0 + 1)
+    gfx.pop()
 
-    -- pass 2: colored 1x1 fill on top
-    gfx.setColor(r, g, b, a)
-    for i = 1, #text do
-      local rows = GLYPHS[text:sub(i, i)]
-      if rows then
-        local gx = ox + (i - 1) * ADVANCE
-        for py = 1, GLYPH_H do
-          local row = rows[py]
-          for px = 1, GLYPH_W do
-            if row:sub(px, px) == "1" then
-              gfx.rectangle("fill", gx + px - 1, oy + py - 1, 1, 1)
-            end
-          end
-        end
-      end
-    end
-
+    -- keep the box crisp through the palette pass (native coords, post-scale)
     if PaletteFX and PaletteFX.markTrueColor then
-      PaletteFX.markTrueColor(ox - 1, oy - 1, totalW + 2, GLYPH_H + 2)
+      PaletteFX.markTrueColor(
+        math.floor(cx - boxW * scale / 2) - 1,
+        math.floor(cy - boxH * scale / 2) - 1,
+        math.ceil(boxW * scale) + 2,
+        math.ceil(boxH * scale) + 2)
     end
   end
 
   ----------------------------------------------------------------------------
-  -- Overlay hook: draw every live number, cull the expired ones
+  -- Overlay hook: track the bar drain, spawn + draw numbers
   ----------------------------------------------------------------------------
   mod.hooks:wrap("battle.overlay", function(next, battle)
-    local result = next() -- let vanilla + lower-priority overlays draw first
+    local result = next()
     if not battle then return result end
-    if optionValue(battle.game, "enabled") ~= "on" then return result end
+    if battle ~= curBattle then resetFor(battle) end
 
-    local now = battle.frame or 0
-    local critWhite = optionValue(battle.game, "crit_color") == "white"
-    local gfx = love.graphics
-    gfx.push("all")
-    gfx.setShader()
+    local t0 = now()
+    local sides = { foe = battle.enemy, player = battle.player }
 
-    for i = #active, 1, -1 do
-      local n = active[i]
-      local age = now - n.born
-      if n.battle ~= battle or age < 0 or age >= LIFE then
-        table.remove(active, i)
-      else
-        local t = age / LIFE
-        local anchor = n.isPlayer and ANCHOR.player or ANCHOR.foe
-        local cx = anchor.x + n.dx
-        local cy = anchor.y - RISE * (1 - (1 - t) * (1 - t)) -- ease-out rise
-        local a = 1
-        if age > LIFE - FADE then a = (LIFE - age) / FADE end
-        local r, g, b = 1, 1, 1
-        if n.crit and not critWhite then
-          r, g, b = CRIT_COLOR[1], CRIT_COLOR[2], CRIT_COLOR[3]
+    -- spawn a number the frame a battler's displayed HP starts falling
+    for side, b in pairs(sides) do
+      local shown = b and b.shownHP
+      if type(shown) == "number" then
+        local prev = prevShown[side]
+        if prev and shown < prev - 0.001 then
+          if not draining[side] then
+            local p = pending[side]
+            if p.total > 0 then
+              floats[#floats + 1] =
+                { amount = p.total, side = side, crit = p.crit, born = t0 }
+              p.total, p.crit = 0, false
+            end
+          end
+          draining[side] = true
+        else
+          draining[side] = false
         end
-        drawNumber(tostring(n.amount), cx, cy, r, g, b, a)
+        prevShown[side] = shown
       end
     end
 
-    gfx.pop()
+    -- forget a hit whose bar never drained (e.g. fully absorbed by a sub)
+    for _, side in ipairs({ "foe", "player" }) do
+      local p = pending[side]
+      if p.total > 0 and t0 - p.at > STALE then p.total, p.crit = 0, false end
+    end
+
+    -- draw
+    if optionValue(battle.game, "enabled") == "on" and Font then
+      local scale = optionValue(battle.game, "size") == "1x" and 1 or 2
+      for i = #floats, 1, -1 do
+        if t0 - floats[i].born >= LIFE then
+          table.remove(floats, i)
+        else
+          drawFloat(floats[i], scale, t0)
+        end
+      end
+    end
+
     return result
   end)
 
   if mod.log and mod.log.info then
-    mod.log:info("Damage Numbers loaded")
+    mod.log:info("Damage Numbers v0.2.0 loaded")
   end
 end

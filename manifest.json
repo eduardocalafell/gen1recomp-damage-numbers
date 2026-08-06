@@ -3,7 +3,7 @@
   "name": "Damage Numbers",
   "author": "eduardocalafell",
   "github": "eduardocalafell/gen1recomp-damage-numbers",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
